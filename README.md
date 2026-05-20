@@ -151,6 +151,19 @@ deactivate
 
 ---
 
+## Training Results
+
+Augmentation effect on Val F1 (10 epochs, ESC-50 3-class):
+
+| Setup | Samples | Best Val F1 | Final Loss |
+|-------|---------|-------------|------------|
+| Originals only | 120 | 0.7980 | 0.9082 |
+| + Offline 7× augmentation | 840 | **0.8904** | **0.2463** |
+
+Offline augmentation (`augment_dataset.py`) + online SpecAugment combined yielded an **+11% absolute F1 gain**. The model also converged steadily across all 10 epochs with the larger dataset, versus plateauing at epoch 4 on originals only.
+
+---
+
 ## API Reference
 
 ### `POST /api/v1/context-stream`
