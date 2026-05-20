@@ -153,14 +153,17 @@ deactivate
 
 ## Training Results
 
-Augmentation effect on Val F1 (10 epochs, ESC-50 3-class):
+Augmentation and epoch count effect on Val F1 (ESC-50 3-class):
 
-| Setup | Samples | Best Val F1 | Final Loss |
-|-------|---------|-------------|------------|
-| Originals only | 120 | 0.7980 | 0.9082 |
-| + Offline 7× augmentation | 840 | **0.8904** | **0.2463** |
+| Setup | Samples | Epochs | Best Val F1 | Final Loss |
+|-------|---------|--------|-------------|------------|
+| Originals only | 120 | 10 | 0.7980 | 0.9082 |
+| + Offline 7× augmentation | 840 | 10 | 0.8904 | 0.2463 |
+| + Offline 7× augmentation | 840 | 100 | **1.0000** | **0.0116** |
 
-Offline augmentation (`augment_dataset.py`) + online SpecAugment combined yielded an **+11% absolute F1 gain**. The model also converged steadily across all 10 epochs with the larger dataset, versus plateauing at epoch 4 on originals only.
+- Offline augmentation (`augment_dataset.py`) + online SpecAugment yielded a **+11% absolute F1 gain** at 10 epochs.
+- Extending to 100 epochs pushed Val F1 to **1.0000** (first achieved at epoch 34, stable from epoch 80+).
+- Val F1 of 1.0 reflects the small validation split (~168 samples); performance on unseen data should be validated separately.
 
 ---
 
