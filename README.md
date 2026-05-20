@@ -58,7 +58,8 @@ An in-vehicle AI framework that continuously listens for acoustic events, classi
 |---------|--------|
 | **Model size** | 170,708 parameters — well under the 1M embedded target |
 | **Inference latency** | ~2ms on CPU (MacBook M-series) |
-| **Sound classes** | background noise, coughing, yawning, infant crying |
+| **Sound classes** | coughing, sneezing, infant crying (3-class, ESC-50 subset) |
+| **Data augmentation** | Offline 7× (speed ×4 + gain ×2) + Online SpecAugment (FreqMask + TimeMask) |
 | **RAG retrieval** | FAISS + `sentence-transformers/all-MiniLM-L6-v2` |
 | **LLM fallback** | Automatic `MockLLM` when no API key is present |
 | **API** | RESTful FastAPI with Pydantic v2 validation |
@@ -84,8 +85,9 @@ AURA/
 ├── utils/
 │   ├── audio_utils.py           # Audio loading & log-mel transform
 │   └── __init__.py
-├── generate_dummy_audio.py      # Synthetic dataset generator
-├── train.py                     # CRNN training script
+├── download_esc50.py            # ESC-50 dataset downloader & class extractor
+├── augment_dataset.py           # Offline 7× augmentation (speed + gain)
+├── train.py                     # CRNN training script (+ online SpecAugment)
 ├── test_pipeline.py             # E2E integration test
 ├── requirements.txt
 └── README.md
@@ -104,31 +106,38 @@ pip install -r requirements.txt
 
 > After activation, your prompt will show `(.venv)`. All subsequent commands assume the environment is active.
 
-### 2. Generate the dummy audio dataset
+### 2. Download & prepare the ESC-50 dataset
 ```bash
-python generate_dummy_audio.py
+python download_esc50.py
 ```
-Creates 20 × 2-second `.wav` files per class (80 total) in `data/`.
+Downloads ESC-50 and extracts the 3 target classes (coughing, sneezing, infant_crying) into `data/` — 40 files per class.
 
-### 3. Train the SED model
+### 3. (Optional) Offline data augmentation — 7× expansion
+```bash
+python augment_dataset.py
+```
+Expands each class from 40 → 280 files using speed perturbation (×0.85, ×0.93, ×1.07, ×1.15) and gain scaling (×0.35, ×2.0). Re-running is idempotent.
+
+### 4. Train the SED model
 ```bash
 python train.py
 ```
 - Runs for 5 epochs; logs F1-score and inference latency per epoch to `training.log`.
 - Saves best weights to `models/sed_model_best.pth`.
+- Online SpecAugment is applied during training: `FrequencyMasking(12)` + `TimeMasking(40)`.
 
-### 4. Start the backend server
+### 5. Start the backend server
 ```bash
 PYTHONPATH=. uvicorn backend.main:app --host 0.0.0.0 --port 8765 --reload
 ```
 
-### 5. Run the E2E test
+### 6. Run the E2E test
 ```bash
 PYTHONPATH=. python test_pipeline.py
 ```
 Automatically starts the backend, runs inference on each audio class, POSTs to the API, and validates the RAG response.
 
-### 6. Manual API test
+### 7. Manual API test
 ```bash
 curl -X POST http://127.0.0.1:8765/api/v1/context-stream \
   -H "Content-Type: application/json" \

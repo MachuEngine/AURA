@@ -7,6 +7,7 @@ import time
 
 import torch
 import torch.nn as nn
+import torchaudio.transforms as T
 from sklearn.metrics import f1_score
 from torch.utils.data import DataLoader, Dataset, random_split
 
@@ -53,6 +54,10 @@ class AudioDataset(Dataset):
     def __init__(self, data_root: str = "data", augment: bool = False):
         self.augment = augment
         self.mel_transform = build_mel_transform()
+        self.spec_augment = nn.Sequential(
+            T.FrequencyMasking(freq_mask_param=12),
+            T.TimeMasking(time_mask_param=40),
+        ) if augment else nn.Identity()
         self.samples: list[tuple[str, int]] = []
 
         for class_name, label in CLASS_DIRS.items():
@@ -82,6 +87,7 @@ class AudioDataset(Dataset):
             waveform = mix_noise_with_snr(waveform, noise, snr_db)
 
         logmel = waveform_to_logmel(waveform, self.mel_transform)
+        logmel = self.spec_augment(logmel)
         logmel = self._pad_or_truncate(logmel)
         return logmel, label
 
