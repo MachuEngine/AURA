@@ -102,6 +102,8 @@ source .venv/bin/activate    # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
 ```
 
+> After activation, your prompt will show `(.venv)`. All subsequent commands assume the environment is active.
+
 ### 2. Generate the dummy audio dataset
 ```bash
 python generate_dummy_audio.py
@@ -131,6 +133,11 @@ Automatically starts the backend, runs inference on each audio class, POSTs to t
 curl -X POST http://127.0.0.1:8765/api/v1/context-stream \
   -H "Content-Type: application/json" \
   -d '{"audio_event":"yawning","confidence":0.92,"driving_hours":3.0,"hvac_status":"internal"}'
+```
+
+### Deactivate the virtual environment
+```bash
+deactivate
 ```
 
 ---
