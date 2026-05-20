@@ -71,7 +71,7 @@ def start_server():
     return proc
 
 
-def wait_for_server(timeout=30):
+def wait_for_server(timeout=60):
     deadline = time.time() + timeout
     while time.time() < deadline:
         try:

@@ -95,15 +95,12 @@ AURA/
 
 ## Quickstart
 
-### 1. Install dependencies
+### 1. Set up virtual environment and install dependencies
 ```bash
+python3 -m venv .venv
+source .venv/bin/activate    # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
 ```
-
-> **Note (macOS / Python 3.9):** If you see a NumPy 2.x compatibility warning with PyTorch, downgrade NumPy:
-> ```bash
-> pip install "numpy<2"
-> ```
 
 ### 2. Generate the dummy audio dataset
 ```bash
