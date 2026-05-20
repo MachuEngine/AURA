@@ -1,36 +1,39 @@
 """End-to-End pipeline test: SED inference → RAG backend POST → result validation."""
+import glob
 import os
+import subprocess
 import sys
 import time
-import subprocess
-import signal
-import json
-import glob
-import torch
+
 import httpx
-import numpy as np
+import torch
 
 from models.sed_model import CRNN
-from utils.audio_utils import load_audio, waveform_to_logmel, build_mel_transform, N_MELS
+from utils.audio_utils import (
+    FIXED_FRAMES,
+    N_MELS,
+    build_mel_transform,
+    load_audio,
+    waveform_to_logmel,
+)
 
 BACKEND_URL = "http://127.0.0.1:8765"
 WEIGHTS_PATH = "models/sed_model_best.pth"
-FIXED_FRAMES = 128
 
-CLASS_LABELS = {0: "background_noise", 1: "coughing", 2: "yawning", 3: "infant_crying"}
-AUDIO_CLASSES_FOR_BACKEND = {
-    0: "background_noise",
-    1: "coughing",
-    2: "yawning",
-    3: "infant_crying",
-}
+CLASS_LABELS = {0: "coughing", 1: "sneezing", 2: "infant_crying"}
+
+
+def first_wav(directory: str) -> str:
+    files = sorted(glob.glob(os.path.join(directory, "*.wav")))
+    assert files, f"No WAV files in {directory}"
+    return files[0]
 
 
 def load_model():
-    model = CRNN(num_classes=4, n_mels=N_MELS)
+    model = CRNN(num_classes=3, n_mels=N_MELS)
     model.load_state_dict(torch.load(WEIGHTS_PATH, map_location="cpu"))
     model.eval()
-    print(f"[STEP 1] Model loaded from {WEIGHTS_PATH}")
+    print(f"[STEP 1] Model loaded  ({WEIGHTS_PATH})")
     return model
 
 
@@ -45,15 +48,14 @@ def infer_audio(model, wav_path: str):
     else:
         logmel = torch.nn.functional.pad(logmel, (0, FIXED_FRAMES - T))
 
-    x = logmel.unsqueeze(0)  # (1, 1, n_mels, T)
     with torch.no_grad():
-        logits = model(x)
+        logits = model(logmel.unsqueeze(0))
         probs = torch.softmax(logits, dim=1)
         class_id = probs.argmax(dim=1).item()
-        confidence = probs[0, class_id].item()
+        confidence = round(probs[0, class_id].item(), 4)
 
     class_name = CLASS_LABELS[class_id]
-    print(f"[STEP 1] Inference: {wav_path} → {class_name} (conf={confidence:.3f})")
+    print(f"[STEP 1] Inference: {os.path.basename(wav_path)} → {class_name} (conf={confidence:.3f})")
     return class_name, confidence
 
 
@@ -61,8 +63,8 @@ def start_server():
     env = os.environ.copy()
     env["PYTHONPATH"] = "."
     proc = subprocess.Popen(
-        [sys.executable, "-m", "uvicorn", "backend.main:app", "--host", "127.0.0.1",
-         "--port", "8765", "--log-level", "warning"],
+        [sys.executable, "-m", "uvicorn", "backend.main:app",
+         "--host", "127.0.0.1", "--port", "8765", "--log-level", "warning"],
         env=env,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
@@ -71,7 +73,7 @@ def start_server():
     return proc
 
 
-def wait_for_server(timeout=60):
+def wait_for_server(timeout: int = 60) -> bool:
     deadline = time.time() + timeout
     while time.time() < deadline:
         try:
@@ -86,7 +88,7 @@ def wait_for_server(timeout=60):
 
 
 def post_to_backend(audio_event: str, confidence: float,
-                    driving_hours: float = 2.5, hvac_status: str = "internal"):
+                    driving_hours: float = 2.5, hvac_status: str = "internal") -> dict:
     payload = {
         "audio_event": audio_event,
         "confidence": confidence,
@@ -99,55 +101,46 @@ def post_to_backend(audio_event: str, confidence: float,
 
 
 def run_tests():
-    all_passed = True
-
-    # Step 1: Load model
     model = load_model()
-
-    # Step 2: Start server
     server_proc = start_server()
+
     try:
         assert wait_for_server(), "Server failed to start within timeout"
 
-        # Step 3: Pick one wav per class and run full E2E
         test_cases = [
-            ("data/coughing/coughing_000.wav", "coughing"),
-            ("data/yawning/yawning_000.wav", "yawning"),
-            ("data/infant_crying/infant_crying_000.wav", "infant_crying"),
-            ("data/background_noise/background_noise_000.wav", "background_noise"),
+            (first_wav("data/coughing"),      "coughing"),
+            (first_wav("data/sneezing"),       "sneezing"),
+            (first_wav("data/infant_crying"),  "infant_crying"),
         ]
 
         for wav_path, expected_class in test_cases:
-            print(f"\n--- Test: {wav_path} ---")
-            # SED inference
+            print(f"\n--- Test: {expected_class} ---")
             class_name, confidence = infer_audio(model, wav_path)
 
-            # POST to backend (use inferred class for realistic E2E)
             result = post_to_backend(class_name, confidence)
             print(f"[STEP 3] RAG response for '{class_name}':")
-            print(f"  Advice   : {result['advice'][:120]}...")
-            print(f"  Command  : {result['command_json'][:80]}")
+            print(f"  Advice : {result['advice'][:120]}...")
+            print(f"  Command: {result['command_json'][:80]}")
+
             assert result["audio_event"] == class_name
             assert result["confidence"] == confidence
             assert len(result["advice"]) > 0
-            assert result["command_json"].strip() != ""
+            assert result["command_json"].strip() not in ("", "{}")
             print(f"  [PASS]")
 
         print("\n=============================")
         print("ALL E2E TESTS PASSED")
         print("=============================")
+        return True
 
     except Exception as e:
-        print(f"\n[FAIL] Test failed: {e}")
-        all_passed = False
+        print(f"\n[FAIL] {e}")
+        return False
     finally:
         server_proc.terminate()
         server_proc.wait()
         print("[CLEANUP] Backend server stopped.")
 
-    return all_passed
-
 
 if __name__ == "__main__":
-    success = run_tests()
-    sys.exit(0 if success else 1)
+    sys.exit(0 if run_tests() else 1)

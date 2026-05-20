@@ -1,16 +1,24 @@
-"""Train the CRNN SED model on the dummy audio dataset."""
-import os
-import time
-import logging
+"""Train the CRNN SED model on ESC-50 data with SNR-based noise augmentation."""
 import glob
+import logging
+import os
+import random
+import time
+
 import torch
 import torch.nn as nn
-from torch.utils.data import Dataset, DataLoader, random_split
 from sklearn.metrics import f1_score
-import numpy as np
+from torch.utils.data import DataLoader, Dataset, random_split
 
 from models.sed_model import CRNN
-from utils.audio_utils import load_audio, waveform_to_logmel, build_mel_transform, N_MELS
+from utils.audio_utils import (
+    FIXED_FRAMES,
+    N_MELS,
+    build_mel_transform,
+    load_audio,
+    mix_noise_with_snr,
+    waveform_to_logmel,
+)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -23,34 +31,57 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 CLASS_DIRS = {
-    "background_noise": 0,
-    "coughing": 1,
-    "yawning": 2,
-    "infant_crying": 3,
+    "coughing":      0,
+    "sneezing":      1,
+    "infant_crying": 2,
 }
 NUM_CLASSES = len(CLASS_DIRS)
-BATCH_SIZE = 8
-EPOCHS = 5
+
+NOISE_DIRS = [
+    "data/noise/vehicle_engine",
+    "data/noise/environmental",
+    "data/noise/hvac",
+]
+SNR_OPTIONS = [0.0, 10.0, 20.0]  # dB
+
+BATCH_SIZE = 16
+EPOCHS = 10
 LR = 1e-3
-FIXED_FRAMES = 128  # fixed time dimension for padding/truncation
 
 
 class AudioDataset(Dataset):
-    def __init__(self, data_root="data"):
-        self.samples = []
+    def __init__(self, data_root: str = "data", augment: bool = False):
+        self.augment = augment
         self.mel_transform = build_mel_transform()
+        self.samples: list[tuple[str, int]] = []
+
         for class_name, label in CLASS_DIRS.items():
             class_dir = os.path.join(data_root, class_name)
-            for wav_path in glob.glob(os.path.join(class_dir, "*.wav")):
-                self.samples.append((wav_path, label))
+            for wav in glob.glob(os.path.join(class_dir, "*.wav")):
+                self.samples.append((wav, label))
 
-    def __len__(self):
+        # Pre-collect noise file paths for augmentation
+        self.noise_files: list[str] = []
+        for d in NOISE_DIRS:
+            self.noise_files.extend(glob.glob(os.path.join(d, "*.wav")))
+
+        if augment and not self.noise_files:
+            log.warning("Augmentation requested but no noise files found in data/noise/")
+
+    def __len__(self) -> int:
         return len(self.samples)
 
-    def __getitem__(self, idx):
+    def __getitem__(self, idx: int):
         path, label = self.samples[idx]
         waveform = load_audio(path)
-        logmel = waveform_to_logmel(waveform, self.mel_transform)  # (1, n_mels, T)
+
+        if self.augment and self.noise_files:
+            noise_path = random.choice(self.noise_files)
+            snr_db = random.choice(SNR_OPTIONS)
+            noise = load_audio(noise_path)
+            waveform = mix_noise_with_snr(waveform, noise, snr_db)
+
+        logmel = waveform_to_logmel(waveform, self.mel_transform)
         logmel = self._pad_or_truncate(logmel)
         return logmel, label
 
@@ -58,37 +89,43 @@ class AudioDataset(Dataset):
         T = logmel.shape[-1]
         if T >= FIXED_FRAMES:
             return logmel[:, :, :FIXED_FRAMES]
-        pad = FIXED_FRAMES - T
-        return torch.nn.functional.pad(logmel, (0, pad))
+        return torch.nn.functional.pad(logmel, (0, FIXED_FRAMES - T))
 
 
-def measure_latency(model, device, n_runs=50):
+def measure_latency(model: nn.Module, device: torch.device, n_runs: int = 50) -> float:
     model.eval()
     dummy = torch.randn(1, 1, N_MELS, FIXED_FRAMES).to(device)
-    # Warmup
     with torch.no_grad():
-        for _ in range(10):
+        for _ in range(10):  # warmup
             model(dummy)
     start = time.perf_counter()
     with torch.no_grad():
         for _ in range(n_runs):
             model(dummy)
-    elapsed_ms = (time.perf_counter() - start) / n_runs * 1000
-    return elapsed_ms
+    return (time.perf_counter() - start) / n_runs * 1000
 
 
 def train():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     log.info(f"Device: {device}")
 
-    dataset = AudioDataset("data")
-    log.info(f"Dataset size: {len(dataset)} samples")
+    full_dataset = AudioDataset("data", augment=False)
+    log.info(f"Total samples: {len(full_dataset)}")
 
-    n_val = max(1, int(0.2 * len(dataset)))
-    n_train = len(dataset) - n_val
-    train_set, val_set = random_split(
-        dataset, [n_train, n_val], generator=torch.Generator().manual_seed(42)
+    n_val = max(1, int(0.2 * len(full_dataset)))
+    n_train = len(full_dataset) - n_val
+    train_indices, val_indices = random_split(
+        range(len(full_dataset)),
+        [n_train, n_val],
+        generator=torch.Generator().manual_seed(42),
     )
+
+    # Train set uses augmentation; val set does not
+    train_set = AudioDataset("data", augment=True)
+    train_set.samples = [full_dataset.samples[i] for i in train_indices]
+    val_set = AudioDataset("data", augment=False)
+    val_set.samples = [full_dataset.samples[i] for i in val_indices]
+
     train_loader = DataLoader(train_set, batch_size=BATCH_SIZE, shuffle=True, num_workers=0)
     val_loader = DataLoader(val_set, batch_size=BATCH_SIZE, shuffle=False, num_workers=0)
 
@@ -107,21 +144,18 @@ def train():
         for x, y in train_loader:
             x, y = x.to(device), y.to(device)
             optimizer.zero_grad()
-            logits = model(x)
-            loss = criterion(logits, y)
+            loss = criterion(model(x), y)
             loss.backward()
             optimizer.step()
             total_loss += loss.item()
         scheduler.step()
         avg_loss = total_loss / len(train_loader)
 
-        # Validation
         model.eval()
         all_preds, all_labels = [], []
         with torch.no_grad():
             for x, y in val_loader:
-                x = x.to(device)
-                preds = model(x).argmax(dim=1).cpu().numpy()
+                preds = model(x.to(device)).argmax(dim=1).cpu().numpy()
                 all_preds.extend(preds)
                 all_labels.extend(y.numpy())
 
@@ -129,7 +163,7 @@ def train():
         latency_ms = measure_latency(model, device)
 
         log.info(
-            f"Epoch {epoch}/{EPOCHS} | Loss: {avg_loss:.4f} | "
+            f"Epoch {epoch:2d}/{EPOCHS} | Loss: {avg_loss:.4f} | "
             f"Val F1: {f1:.4f} | Latency: {latency_ms:.2f}ms"
         )
 
@@ -138,10 +172,9 @@ def train():
             os.makedirs("models", exist_ok=True)
             torch.save(model.state_dict(), "models/sed_model_best.pth")
 
-    # Save final weights
     torch.save(model.state_dict(), "models/sed_model_final.pth")
     log.info(f"Training complete. Best Val F1: {best_f1:.4f}")
-    log.info("Weights saved to models/sed_model_best.pth and models/sed_model_final.pth")
+    log.info("Weights saved → models/sed_model_best.pth  models/sed_model_final.pth")
 
 
 if __name__ == "__main__":
