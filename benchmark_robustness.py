@@ -1,19 +1,16 @@
 """Robustness benchmark: evaluate Baseline vs Proposed under noisy conditions.
 
-Evaluates both models on the same held-out validation split (seed=42, 20%)
-under four SNR regimes: Clean (no noise), 20 dB, 10 dB, 0 dB.
-Outputs per-condition Precision / Recall / F1-Score and saves results to
-benchmark_results.json.
+Validation set: Fold-5 originals only (no _aug_ files) — identical to train.py split.
+Conditions: Clean (no noise), SNR 20 dB, 10 dB, 0 dB.
+Results saved to benchmark_results.json.
 """
 import glob
 import json
 import os
 import random
-import time
 
 import torch
-from sklearn.metrics import classification_report, f1_score, precision_score, recall_score
-from torch.utils.data import random_split
+from sklearn.metrics import f1_score, precision_score, recall_score
 
 from models.sed_model import CRNN
 from utils.audio_utils import (
@@ -36,27 +33,17 @@ MODELS = {
     "Proposed": "models/sed_robust_best.pth",
 }
 SNR_CONDITIONS = [None, 20.0, 10.0, 0.0]  # None = clean
-SEED = 42
-VAL_RATIO = 0.2
 
 
-def load_all_samples(data_root="data"):
+def build_val_samples(data_root="data"):
+    """Fold 5 originals strictly — no _aug_ files."""
     samples = []
     for name, label in CLASS_DIRS.items():
         for wav in sorted(glob.glob(os.path.join(data_root, name, "*.wav"))):
-            samples.append((wav, label))
+            basename = os.path.basename(wav)
+            if basename.startswith("5-") and "_aug_" not in basename:
+                samples.append((wav, label))
     return samples
-
-
-def get_val_samples(samples):
-    n_val = max(1, int(VAL_RATIO * len(samples)))
-    n_train = len(samples) - n_val
-    _, val_idx = random_split(
-        range(len(samples)),
-        [n_train, n_val],
-        generator=torch.Generator().manual_seed(SEED),
-    )
-    return [samples[i] for i in val_idx]
 
 
 def load_noise_files():
@@ -84,40 +71,34 @@ def evaluate_condition(model, val_samples, noise_files, snr_db, mel_transform, d
             if snr_db is not None and noise_files:
                 noise = load_audio(rng.choice(noise_files))
                 waveform = mix_noise_with_snr(waveform, noise, snr_db)
-            logmel = waveform_to_logmel(waveform, mel_transform)
-            logmel = pad_or_truncate(logmel)
+            logmel = pad_or_truncate(waveform_to_logmel(waveform, mel_transform))
             logits = model(logmel.unsqueeze(0).to(device))
-            pred = logits.argmax(dim=1).item()
-            all_preds.append(pred)
+            all_preds.append(logits.argmax(dim=1).item())
             all_labels.append(label)
 
-    precision = precision_score(all_labels, all_preds, average="macro", zero_division=0)
-    recall = recall_score(all_labels, all_preds, average="macro", zero_division=0)
-    f1 = f1_score(all_labels, all_preds, average="macro", zero_division=0)
-    return precision, recall, f1
-
-
-def load_model(path, device):
-    model = CRNN(num_classes=3, n_mels=N_MELS).to(device)
-    model.load_state_dict(torch.load(path, map_location=device))
-    model.eval()
-    return model
+    p = precision_score(all_labels, all_preds, average="macro", zero_division=0)
+    r = recall_score(all_labels, all_preds, average="macro", zero_division=0)
+    f = f1_score(all_labels, all_preds, average="macro", zero_division=0)
+    return p, r, f
 
 
 def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")
 
-    all_samples = load_all_samples()
-    val_samples = get_val_samples(all_samples)
+    val_samples = build_val_samples()
     noise_files = load_noise_files()
     mel_transform = build_mel_transform()
 
-    print(f"Val samples: {len(val_samples)}, Noise files: {len(noise_files)}")
+    print(f"Val samples (Fold-5 originals): {len(val_samples)}")
+    print(f"Noise files: {len(noise_files)}")
 
     results = {}
     for model_name, model_path in MODELS.items():
-        model = load_model(model_path, device)
+        model = CRNN(num_classes=3, n_mels=N_MELS).to(device)
+        model.load_state_dict(torch.load(model_path, map_location=device))
+        model.eval()
+
         results[model_name] = {}
         print(f"\n=== {model_name} ===")
         print(f"{'Condition':<12} {'Precision':>10} {'Recall':>8} {'F1':>8}")
@@ -130,17 +111,15 @@ def main():
             )
             results[model_name][cond_label] = {
                 "precision": round(p, 4),
-                "recall": round(r, 4),
-                "f1": round(f, 4),
+                "recall":    round(r, 4),
+                "f1":        round(f, 4),
             }
             print(f"  {cond_label:<10} {p:>10.4f} {r:>8.4f} {f:>8.4f}")
 
-    # Save results
     with open("benchmark_results.json", "w") as fh:
         json.dump(results, fh, indent=2)
     print("\nResults saved to benchmark_results.json")
 
-    # Print comparison table
     print("\n--- Robustness Comparison (F1-Score) ---")
     conditions = ["Clean", "SNR 20dB", "SNR 10dB", "SNR 0dB"]
     print(f"{'Condition':<12} {'Baseline':>10} {'Proposed':>10} {'Delta':>8}")
