@@ -1,0 +1,46 @@
+{
+  "Baseline": {
+    "Clean": {
+      "precision": 1.0,
+      "recall": 1.0,
+      "f1": 1.0
+    },
+    "SNR 20dB": {
+      "precision": 0.9524,
+      "recall": 0.9447,
+      "f1": 0.9465
+    },
+    "SNR 10dB": {
+      "precision": 0.8793,
+      "recall": 0.8554,
+      "f1": 0.8486
+    },
+    "SNR 0dB": {
+      "precision": 0.7909,
+      "recall": 0.7472,
+      "f1": 0.7305
+    }
+  },
+  "Proposed": {
+    "Clean": {
+      "precision": 0.9874,
+      "recall": 0.9881,
+      "f1": 0.9875
+    },
+    "SNR 20dB": {
+      "precision": 1.0,
+      "recall": 1.0,
+      "f1": 1.0
+    },
+    "SNR 10dB": {
+      "precision": 1.0,
+      "recall": 1.0,
+      "f1": 1.0
+    },
+    "SNR 0dB": {
+      "precision": 1.0,
+      "recall": 1.0,
+      "f1": 1.0
+    }
+  }
+}

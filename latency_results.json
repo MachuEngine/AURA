@@ -1,0 +1,26 @@
+{
+  "n_runs": 100,
+  "device": "cpu",
+  "stages": {
+    "feature_extraction_ms": {
+      "mean": 9.243,
+      "std": 2.663
+    },
+    "sed_inference_ms": {
+      "mean": 11.202,
+      "std": 3.279
+    },
+    "faiss_retrieval_ms": {
+      "mean": 52.271,
+      "std": 45.146
+    },
+    "llm_generation_ms": {
+      "mean": 0.017,
+      "std": 0.008
+    }
+  },
+  "total_e2e_ms": {
+    "mean": 72.733,
+    "std": 45.344
+  }
+}

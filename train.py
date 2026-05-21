@@ -1,4 +1,8 @@
-"""Train the CRNN SED model on ESC-50 data with SNR-based noise augmentation."""
+"""Train Baseline and Proposed CRNN SED models on ESC-50 data.
+
+Baseline  — no noise mixing, no SpecAugment → models/sed_baseline.pth
+Proposed  — on-the-fly SNR noise mixing + SpecAugment → models/sed_robust_best.pth
+"""
 import glob
 import logging
 import os
@@ -51,13 +55,13 @@ LR = 1e-3
 
 
 class AudioDataset(Dataset):
-    def __init__(self, data_root: str = "data", augment: bool = False):
-        self.augment = augment
+    def __init__(self, data_root: str = "data", noise_aug: bool = False, spec_aug: bool = False):
+        self.noise_aug = noise_aug
         self.mel_transform = build_mel_transform()
         self.spec_augment = nn.Sequential(
             T.FrequencyMasking(freq_mask_param=12),
             T.TimeMasking(time_mask_param=40),
-        ) if augment else nn.Identity()
+        ) if spec_aug else nn.Identity()
         self.samples: list[tuple[str, int]] = []
 
         for class_name, label in CLASS_DIRS.items():
@@ -65,13 +69,12 @@ class AudioDataset(Dataset):
             for wav in glob.glob(os.path.join(class_dir, "*.wav")):
                 self.samples.append((wav, label))
 
-        # Pre-collect noise file paths for augmentation
         self.noise_files: list[str] = []
         for d in NOISE_DIRS:
             self.noise_files.extend(glob.glob(os.path.join(d, "*.wav")))
 
-        if augment and not self.noise_files:
-            log.warning("Augmentation requested but no noise files found in data/noise/")
+        if noise_aug and not self.noise_files:
+            log.warning("noise_aug=True but no noise files found in data/noise/")
 
     def __len__(self) -> int:
         return len(self.samples)
@@ -80,11 +83,9 @@ class AudioDataset(Dataset):
         path, label = self.samples[idx]
         waveform = load_audio(path)
 
-        if self.augment and self.noise_files:
-            noise_path = random.choice(self.noise_files)
-            snr_db = random.choice(SNR_OPTIONS)
-            noise = load_audio(noise_path)
-            waveform = mix_noise_with_snr(waveform, noise, snr_db)
+        if self.noise_aug and self.noise_files:
+            noise = load_audio(random.choice(self.noise_files))
+            waveform = mix_noise_with_snr(waveform, noise, random.choice(SNR_OPTIONS))
 
         logmel = waveform_to_logmel(waveform, self.mel_transform)
         logmel = self.spec_augment(logmel)
@@ -92,17 +93,17 @@ class AudioDataset(Dataset):
         return logmel, label
 
     def _pad_or_truncate(self, logmel: torch.Tensor) -> torch.Tensor:
-        T = logmel.shape[-1]
-        if T >= FIXED_FRAMES:
+        t = logmel.shape[-1]
+        if t >= FIXED_FRAMES:
             return logmel[:, :, :FIXED_FRAMES]
-        return torch.nn.functional.pad(logmel, (0, FIXED_FRAMES - T))
+        return torch.nn.functional.pad(logmel, (0, FIXED_FRAMES - t))
 
 
 def measure_latency(model: nn.Module, device: torch.device, n_runs: int = 50) -> float:
     model.eval()
     dummy = torch.randn(1, 1, N_MELS, FIXED_FRAMES).to(device)
     with torch.no_grad():
-        for _ in range(10):  # warmup
+        for _ in range(10):
             model(dummy)
     start = time.perf_counter()
     with torch.no_grad():
@@ -111,26 +112,28 @@ def measure_latency(model: nn.Module, device: torch.device, n_runs: int = 50) ->
     return (time.perf_counter() - start) / n_runs * 1000
 
 
-def train():
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    log.info(f"Device: {device}")
+def run_training(noise_aug: bool, save_path: str, label: str, device: torch.device) -> float:
+    log.info(f"{'='*60}")
+    log.info(f"Training: {label}")
+    log.info(f"  noise_aug={noise_aug}  save → {save_path}")
+    log.info(f"{'='*60}")
 
-    full_dataset = AudioDataset("data", augment=False)
-    log.info(f"Total samples: {len(full_dataset)}")
+    # Build index split once from a neutral dataset (no augmentation)
+    index_ds = AudioDataset("data", noise_aug=False, spec_aug=False)
+    log.info(f"Total samples: {len(index_ds)}")
 
-    n_val = max(1, int(0.2 * len(full_dataset)))
-    n_train = len(full_dataset) - n_val
-    train_indices, val_indices = random_split(
-        range(len(full_dataset)),
+    n_val = max(1, int(0.2 * len(index_ds)))
+    n_train = len(index_ds) - n_val
+    train_idx, val_idx = random_split(
+        range(len(index_ds)),
         [n_train, n_val],
         generator=torch.Generator().manual_seed(42),
     )
 
-    # Train set uses augmentation; val set does not
-    train_set = AudioDataset("data", augment=True)
-    train_set.samples = [full_dataset.samples[i] for i in train_indices]
-    val_set = AudioDataset("data", augment=False)
-    val_set.samples = [full_dataset.samples[i] for i in val_indices]
+    train_set = AudioDataset("data", noise_aug=noise_aug, spec_aug=noise_aug)
+    train_set.samples = [index_ds.samples[i] for i in train_idx]
+    val_set = AudioDataset("data", noise_aug=False, spec_aug=False)
+    val_set.samples = [index_ds.samples[i] for i in val_idx]
 
     train_loader = DataLoader(train_set, batch_size=BATCH_SIZE, shuffle=True, num_workers=0)
     val_loader = DataLoader(val_set, batch_size=BATCH_SIZE, shuffle=False, num_workers=0)
@@ -155,7 +158,6 @@ def train():
             optimizer.step()
             total_loss += loss.item()
         scheduler.step()
-        avg_loss = total_loss / len(train_loader)
 
         model.eval()
         all_preds, all_labels = [], []
@@ -169,19 +171,43 @@ def train():
         latency_ms = measure_latency(model, device)
 
         log.info(
-            f"Epoch {epoch:2d}/{EPOCHS} | Loss: {avg_loss:.4f} | "
+            f"[{label}] Epoch {epoch:3d}/{EPOCHS} | "
+            f"Loss: {total_loss / len(train_loader):.4f} | "
             f"Val F1: {f1:.4f} | Latency: {latency_ms:.2f}ms"
         )
 
         if f1 >= best_f1:
             best_f1 = f1
             os.makedirs("models", exist_ok=True)
-            torch.save(model.state_dict(), "models/sed_model_best.pth")
+            torch.save(model.state_dict(), save_path)
 
-    torch.save(model.state_dict(), "models/sed_model_final.pth")
-    log.info(f"Training complete. Best Val F1: {best_f1:.4f}")
-    log.info("Weights saved → models/sed_model_best.pth  models/sed_model_final.pth")
+    log.info(f"[{label}] Best Val F1: {best_f1:.4f}  →  {save_path}")
+    return best_f1
 
 
 if __name__ == "__main__":
-    train()
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    log.info(f"Device: {device}")
+
+    baseline_f1 = run_training(
+        noise_aug=False,
+        save_path="models/sed_baseline.pth",
+        label="Baseline",
+        device=device,
+    )
+
+    proposed_f1 = run_training(
+        noise_aug=True,
+        save_path="models/sed_robust_best.pth",
+        label="Proposed",
+        device=device,
+    )
+
+    log.info("")
+    log.info("=" * 50)
+    log.info("  Ablation Study Results")
+    log.info("=" * 50)
+    log.info(f"  Baseline (no noise aug) : Val F1 = {baseline_f1:.4f}")
+    log.info(f"  Proposed (SNR noise aug): Val F1 = {proposed_f1:.4f}")
+    log.info(f"  Delta                   : {proposed_f1 - baseline_f1:+.4f}")
+    log.info("=" * 50)
