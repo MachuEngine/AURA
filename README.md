@@ -56,10 +56,11 @@ An in-vehicle AI framework that continuously listens for acoustic events, classi
 
 | Feature | Detail |
 |---------|--------|
-| **Model size** | 170,708 parameters — well under the 1M embedded target |
-| **Inference latency** | ~2ms on CPU (MacBook M-series) |
+| **Model size** | 170,579 parameters — well under the 1M embedded target |
+| **Inference latency** | ~11ms SED core on CPU; ~73ms full E2E (100-run avg) |
 | **Sound classes** | coughing, sneezing, infant crying (3-class, ESC-50 subset) |
-| **Data augmentation** | Offline 7× (speed ×4 + gain ×2) + Online SpecAugment (FreqMask + TimeMask) |
+| **Data augmentation** | Offline 7× (speed ×4 + gain ×2) + Online gain jitter / polarity inversion + SpecAugment (Proposed) |
+| **Train/Val split** | ESC-50 official 5-Fold: Folds 1–4 train, Fold 5 val (zero leakage) |
 | **RAG retrieval** | FAISS + `sentence-transformers/all-MiniLM-L6-v2` |
 | **LLM fallback** | Automatic `MockLLM` when no API key is present |
 | **API** | RESTful FastAPI with Pydantic v2 validation |
@@ -70,24 +71,31 @@ An in-vehicle AI framework that continuously listens for acoustic events, classi
 
 ```
 AURA/
-├── data/                        # Dummy audio dataset (git-ignored, regenerate below)
-│   ├── background_noise/
-│   ├── coughing/
-│   ├── yawning/
-│   └── infant_crying/
+├── data/                        # Audio dataset (git-ignored, regenerate below)
+│   ├── coughing/                #   Fold 1-4: orig + aug | Fold 5: orig only
+│   ├── sneezing/
+│   ├── infant_crying/
+│   └── noise/
+│       ├── vehicle_engine/
+│       ├── environmental/
+│       └── hvac/
 ├── models/
-│   ├── sed_model.py             # CRNN architecture definition
+│   ├── sed_model.py             # CRNN architecture (170,579 params)
+│   ├── sed_baseline.pth         # Baseline weights (git-ignored)
+│   ├── sed_robust_best.pth      # Proposed weights (git-ignored)
 │   └── __init__.py
 ├── backend/
 │   ├── main.py                  # FastAPI application + endpoint
 │   ├── rag_chain.py             # FAISS vectorstore + LLM RAG chain
 │   └── __init__.py
 ├── utils/
-│   ├── audio_utils.py           # Audio loading & log-mel transform
+│   ├── audio_utils.py           # Audio loading, log-mel, SNR mixing
 │   └── __init__.py
 ├── download_esc50.py            # ESC-50 dataset downloader & class extractor
 ├── augment_dataset.py           # Offline 7× augmentation (speed + gain)
-├── train.py                     # CRNN training script (+ online SpecAugment)
+├── train.py                     # Baseline + Proposed ablation training (fold-5 split)
+├── benchmark_robustness.py      # SNR-condition robustness evaluation
+├── benchmark_e2e.py             # End-to-end latency profiling (100 runs)
 ├── test_pipeline.py             # E2E integration test
 ├── requirements.txt
 └── README.md
@@ -122,22 +130,29 @@ Expands each class from 40 → 280 files using speed perturbation (×0.85, ×0.9
 ```bash
 python train.py
 ```
-- Runs for 5 epochs; logs F1-score and inference latency per epoch to `training.log`.
-- Saves best weights to `models/sed_model_best.pth`.
-- Online SpecAugment is applied during training: `FrequencyMasking(12)` + `TimeMasking(40)`.
+- Runs **Baseline** (no noise) then **Proposed** (SNR mixing + SpecAugment) — 50 epochs each.
+- Uses the **ESC-50 official 5-Fold split**: Folds 1–4 for training (orig + aug), Fold 5 for validation (originals only). No data leakage between augmented variants.
+- Saves best weights to `models/sed_baseline.pth` and `models/sed_robust_best.pth`.
+- Logs F1-score and inference latency per epoch to `training.log`.
 
 ### 5. Start the backend server
 ```bash
 PYTHONPATH=. uvicorn backend.main:app --host 0.0.0.0 --port 8765 --reload
 ```
 
-### 6. Run the E2E test
+### 6. Run robustness & latency benchmarks
+```bash
+python benchmark_robustness.py   # Fold-5 eval at Clean / SNR 20dB / 10dB / 0dB
+python benchmark_e2e.py          # 100-run per-stage latency profiling
+```
+
+### 7. Run the E2E integration test
 ```bash
 PYTHONPATH=. python test_pipeline.py
 ```
 Automatically starts the backend, runs inference on each audio class, POSTs to the API, and validates the RAG response.
 
-### 7. Manual API test
+### 8. Manual API test
 ```bash
 curl -X POST http://127.0.0.1:8765/api/v1/context-stream \
   -H "Content-Type: application/json" \
@@ -153,17 +168,32 @@ deactivate
 
 ## Training Results
 
-Augmentation and epoch count effect on Val F1 (ESC-50 3-class):
+Ablation study under the **ESC-50 5-Fold protocol** (Fold-5 validation, 24 original samples — zero data leakage):
 
-| Setup | Samples | Epochs | Best Val F1 | Final Loss |
-|-------|---------|--------|-------------|------------|
-| Originals only | 120 | 10 | 0.7980 | 0.9082 |
-| + Offline 7× augmentation | 840 | 10 | 0.8904 | 0.2463 |
-| + Offline 7× augmentation | 840 | 100 | **1.0000** | **0.0116** |
+### Clean vs. Noisy Condition Robustness (macro F1-Score)
 
-- Offline augmentation (`augment_dataset.py`) + online SpecAugment yielded a **+11% absolute F1 gain** at 10 epochs.
-- Extending to 100 epochs pushed Val F1 to **1.0000** (first achieved at epoch 34, stable from epoch 80+).
-- Val F1 of 1.0 reflects the small validation split (~168 samples); performance on unseen data should be validated separately.
+| Condition | Baseline | Proposed | Δ | Relative Gain |
+|-----------|----------|----------|---|---------------|
+| Clean | 0.8739 | **0.9167** | +0.0428 | +4.9% |
+| SNR 20 dB | 0.6872 | **0.8739** | +0.1867 | +27.2% |
+| SNR 10 dB | 0.5481 | **0.8739** | +0.3258 | +59.4% |
+| SNR 0 dB | 0.4532 | **0.8331** | +0.3799 | **+83.8%** |
+
+- **Baseline**: trained on Folds 1–4 (orig + 7× offline aug) with online gain jitter and polarity inversion only.
+- **Proposed**: identical setup + on-the-fly SNR noise mixing (0/10/20 dB) + SpecAugment (FreqMask 16, TimeMask 50).
+- The Proposed model degrades by only **9.1%** from clean to 0 dB SNR, versus **48.1%** degradation for the Baseline.
+
+### End-to-End Latency (CPU, 100 runs)
+
+| Stage | Mean | Std |
+|-------|------|-----|
+| Feature extraction (log-Mel) | 9.24 ms | 2.66 ms |
+| SED model inference (CRNN) | 11.20 ms | 3.28 ms |
+| FAISS vector retrieval | 52.27 ms | 45.15 ms |
+| LLM command generation | 0.02 ms | 0.01 ms |
+| **Total E2E** | **72.73 ms** | 45.34 ms |
+
+SED core (feature extraction + inference): **20.44 ms** — suitable for real-time embedded deployment.
 
 ---
 
@@ -199,22 +229,22 @@ Augmentation and epoch count effect on Val F1 (ESC-50 3-class):
 ## Model Architecture
 
 ```
-Input: (B, 1, 64, 128)  — batch × channel × mel_bins × time_frames
+Input: (B, 1, 64, 313)  — batch × channel × mel_bins(64) × time_frames(313, 5s@16kHz)
 
 CNN Backbone:
-  ConvBlock(1  → 16):  Conv2d + BN + ReLU + MaxPool(2×2) + Dropout2d
-  ConvBlock(16 → 32):  Conv2d + BN + ReLU + MaxPool(2×2) + Dropout2d
-  ConvBlock(32 → 48):  Conv2d + BN + ReLU + MaxPool(2×2) + Dropout2d
-  ConvBlock(48 → 64):  Conv2d + BN + ReLU + MaxPool(2×2) + Dropout2d
+  ConvBlock(1  → 16):  Conv2d(3×3) + BN + ReLU + MaxPool(2×2) + Dropout2d(0.1)
+  ConvBlock(16 → 32):  Conv2d(3×3) + BN + ReLU + MaxPool(2×2) + Dropout2d(0.1)
+  ConvBlock(32 → 48):  Conv2d(3×3) + BN + ReLU + MaxPool(2×2) + Dropout2d(0.1)
+  ConvBlock(48 → 64):  Conv2d(3×3) + BN + ReLU + MaxPool(2×2) + Dropout2d(0.1)
 
-Output: (B, 64, 4, T')  →  reshape to (B, T', 256)
+Output: (B, 64, 4, ~19)  →  reshape to (B, ~19, 256)
 
-Bi-GRU:  hidden=64, bidirectional → output (B, T', 128)
+Bi-GRU:  hidden=64, bidirectional → output (B, ~19, 128)
 Global average pooling → (B, 128)
 
-Classifier: Dropout(0.3) + Linear(128 → 4)
+Classifier: Dropout(0.3) + Linear(128 → 3)
 
-Total parameters: 170,708  (<1M ✓)
+Total parameters: 170,579  (<1M ✓)
 ```
 
 ---
