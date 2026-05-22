@@ -42,5 +42,6 @@ training.log
 # Sentence-transformer download cache
 sentence_transformers/
 
-# Paper draft (not version-controlled)
+# Paper drafts (not version-controlled)
 PAPER_DRAFT.md
+PAPER_DRAFT_KR.md
